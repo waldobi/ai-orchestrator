@@ -7,6 +7,8 @@ and Cursor. It shows each account's 5-hour and weekly limits live, warns you bef
 coding request to the account with the most room. Everything runs on your Mac with the logins you already have:
 no server, no sign-up, no telemetry.
 
+**[See it in action, with a demo you can drag around →](https://youfoundwaldo.com/ai-orchestrator)**
+
 ![The menu-bar panel: every account's 5-hour and weekly limits, which one to use next, and spend this month](docs/images/panel.png)
 
 <sub>Screenshots use the built-in demo mode (`scripts/demo.sh`), so every account and number is made up.</sub>
