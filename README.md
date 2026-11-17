@@ -51,8 +51,8 @@ no server, no sign-up, no telemetry.
   - [Claude desktop app](https://claude.ai/download) and/or the Claude Code CLI (`claude`)
   - OpenAI Codex CLI (`codex`)
   - Cursor CLI (`cursor-agent`)
-- Optional: [T3 Code](https://www.npmjs.com/package/t3) (`npm i -g t3`, then `t3 service install`). The request
-  engine uses it when it's running.
+- Optional: [T3 Code](https://github.com/pingdotgg/t3code) (`npm i -g t3`, then `t3 service install`). The request
+  engine uses it when it's running. See [Built on](#built-on).
 
 ## Install (one command)
 
@@ -177,6 +177,22 @@ backing that file up, and leaves an existing status line alone. For a second Cla
 | `install.sh` | One-line installer (clone or update, then `install.command`) |
 | `scripts/demo.sh` | Demo mode with made-up data |
 | `docs/images/` | Screenshots (demo data) |
+
+## Built on
+
+AI Orchestrator is plain Swift and uses only Apple's own frameworks (SwiftUI, AppKit, WidgetKit, Charts and the
+system SQLite), so it pulls in no third-party packages. It works with, and leans on, these projects:
+
+- **[T3 Code](https://github.com/pingdotgg/t3code)** by pingdotgg, MIT license. When T3 Code's local service is
+  running, the request engine runs Plan, Build and Review through its server instead of starting the CLIs itself
+  (`T3.swift`), and the request window is laid out like T3 Code's own app.
+- **[Codex CLI](https://github.com/openai/codex)** by OpenAI, Apache 2.0 license. It runs the requests sent to Codex,
+  and AI Orchestrator reads Codex's limits from the lines it writes to its own logs.
+- **[Claude Code](https://claude.com/claude-code)** and the Claude desktop app by Anthropic, and
+  **[Cursor](https://cursor.com)**'s `cursor-agent`. These aren't open source. AI Orchestrator only runs them and reads
+  usage with your own sign-in.
+
+AI Orchestrator isn't affiliated with any of these projects or companies.
 
 ## License
 
