@@ -1,0 +1,32 @@
+# Build output
+*.app
+*.icns
+*.iconset/
+build/
+DerivedData/
+*.xcarchive
+*.ipa
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+
+# Local data, exports and secrets: never commit
+*.csv
+*.jsonl
+.env
+.env.*
+*.p8
+*.p12
+*.mobileprovision
+AuthKey_*
+ExportOptions*.plist
+screenshots/
+backups/
+reports/
+/HANDOFF*.md
+/.handoff/
+
+# macOS
+.DS_Store

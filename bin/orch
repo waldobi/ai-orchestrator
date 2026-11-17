@@ -1,0 +1,25 @@
+#!/bin/zsh
+# orch — open AI Orchestrator's Overview from anywhere, or send it a request.
+#   orch                     opens the Overview; inside a git project, on that project
+#   orch board               opens the Overview
+#   orch <folder>            opens on that folder
+#   orch "fix the login bug" sends a Read request (Auto) for the project of this folder
+#   orch -e "fix the bug"    the same as an Edit request, on a branch of its own
+# Same as ⌥⌘K. Starts AI Orchestrator first if it isn't running.
+app="$HOME/Applications/AI Orchestrator.app"
+pgrep -qx AIOrchestrator || { open "$app"; sleep 2; }
+scope="read"
+if [[ "$1" == "-e" || "$1" == "--edit" ]]; then scope="edit"; shift; fi
+what="requests"
+if [[ "$1" == "board" || "$1" == "overview" ]]; then
+  what="board"
+elif [[ $# -eq 0 || -d "$1" ]]; then
+  dir="${1:-$PWD}"
+  root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)"
+  [[ -n "$root" ]] && what="requests:$root"
+else
+  root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)"
+  if [[ -z "$root" ]]; then echo "orch: this folder isn't in a git project, so there's nowhere to send that." >&2; exit 1; fi
+  what="send:$scope|$root"$'\n'"$*"
+fi
+ORCH_WHAT="$what" /usr/bin/swift -e 'import Foundation; DistributedNotificationCenter.default().postNotificationName(Notification.Name("local.ai-orchestrator.open"), object: ProcessInfo.processInfo.environment["ORCH_WHAT"], userInfo: nil, deliverImmediately: true)' >/dev/null 2>&1

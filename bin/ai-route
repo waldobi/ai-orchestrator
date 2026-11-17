@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Route a coding task to the AI command-line tool that still has room.
+
+Reads the live limits Claude Switcher saves to
+~/Library/Application Support/local.ai-orchestrator/status.json (real numbers only; nothing is
+estimated). Order of preference for coding: Cursor, then Codex, then Claude. A tool is skipped when
+its limit is used up, so work never goes to a plan that would bill extra usage.
+
+  ai-route status                      show every account and which tool would get the next job
+  ai-route pick                        print just the tool name
+  ai-route run [--tool T] [--dir D] "task"   run the task headless in D (default: current folder)
+"""
+import argparse, datetime as dt, json, os, shutil, subprocess, sys
+
+STATUS = os.path.expanduser("~/Library/Application Support/local.ai-orchestrator/status.json")
+ORDER = ["cursor", "codex", "claude"]
+CLI = {"cursor": "cursor-agent", "codex": "codex", "claude": "claude"}
+
+
+def load():
+    try:
+        with open(STATUS) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        sys.exit("No status yet. Make sure Claude Switcher is running, then try again.")
+
+
+def when(iso):
+    if not iso:
+        return ""
+    t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone()
+    return t.strftime("%a %-I:%M %p") if (t - dt.datetime.now().astimezone()).days < 6 else t.strftime("%b %-d")
+
+
+def claude_email():
+    try:
+        with open(os.path.expanduser("~/.claude.json")) as f:
+            return (json.load(f).get("oauthAccount") or {}).get("emailAddress")
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def target_for(tool, targets):
+    """The widget's entry for the account each command-line tool is signed in to."""
+    if tool == "cursor":
+        return next((t for t in targets if t["id"] == "cursor:main"), None)
+    if tool == "codex":
+        return next((t for t in targets if t["id"] == "codex:main"), None)
+    email = claude_email()
+    return next((t for t in targets if t["id"].startswith("claude:") and t.get("email") == email), None)
+
+
+def age_warning(status):
+    updated = dt.datetime.fromisoformat(status["updated"].replace("Z", "+00:00"))
+    mins = (dt.datetime.now(dt.timezone.utc) - updated).total_seconds() / 60
+    return f"(numbers are {int(mins)} min old)" if mins > 20 else ""
+
+
+def choose(status):
+    for tool in ORDER:
+        t = target_for(tool, status["targets"])
+        if t and not t["blocked"] and shutil.which(CLI[tool]):
+            return tool, t
+    return None, None
+
+
+def cmd_status(status):
+    print(f"Claude Switcher limits {age_warning(status)}".rstrip())
+    for t in status["targets"]:
+        used = 100 - t["room"]
+        reset = when(t.get("freesAt") if t["blocked"] else (t.get("weeklyResets") or t.get("shortResets")))
+        flags = (" ← next in widget" if t["pick"] else "") + (" · billing extra" if t["paysExtra"] and t["blocked"] else "")
+        print(f"  {t['name']:<12} {used:5.0f}% used  {'frees ' if t['blocked'] else 'resets '}{reset}{flags}")
+    print("Command-line tools:")
+    for tool in ORDER:
+        t = target_for(tool, status["targets"])
+        where = t["name"] if t else "no usage data"
+        state = "not installed" if not shutil.which(CLI[tool]) else ("used up" if t and t["blocked"] else ("ready" if t else "unknown"))
+        print(f"  {tool:<7} → {where:<12} {state}")
+    tool, _ = choose(status)
+    print(f"Next coding job goes to: {tool or 'nothing (every tool is at its limit)'}")
+
+
+def cmd_run(status, tool, folder, task):
+    if tool:
+        t = target_for(tool, status["targets"])
+        if t and t["blocked"]:
+            sys.exit(f"{tool} is at its limit until {when(t.get('freesAt'))}. Leave out --tool to route automatically.")
+    else:
+        tool, t = choose(status)
+        if not tool:
+            frees = min((x.get("freesAt") or "9999") for x in status["targets"])
+            sys.exit(f"Every tool is at its limit. The first one frees up {when(frees) if frees != '9999' else 'at an unknown time'}.")
+    room = f"{t['room']:.0f}% left" if t else "no usage data"
+    print(f"→ {tool} ({t['name'] if t else '?'}, {room}) {age_warning(status)}".rstrip(), file=sys.stderr, flush=True)
+    folder = os.path.abspath(folder)
+    if tool == "cursor":
+        args = [CLI[tool], "-p", "--force", "--output-format", "text", "--workspace", folder, task]
+    elif tool == "codex":
+        args = [CLI[tool], "exec", "-s", "workspace-write", "-C", folder, task]
+    else:
+        args = [CLI[tool], "-p", "--permission-mode", "acceptEdits", task]
+    sys.exit(subprocess.call(args, cwd=folder))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status")
+    sub.add_parser("pick")
+    r = sub.add_parser("run")
+    r.add_argument("--tool", choices=ORDER)
+    r.add_argument("--dir", default=".")
+    r.add_argument("task")
+    a = p.parse_args()
+    status = load()
+    if a.cmd == "status":
+        cmd_status(status)
+    elif a.cmd == "pick":
+        tool, _ = choose(status)
+        print(tool or "none")
+    else:
+        cmd_run(status, a.tool, a.dir, a.task)
+
+
+if __name__ == "__main__":
+    main()

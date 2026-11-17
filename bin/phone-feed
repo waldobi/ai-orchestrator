@@ -1,0 +1,886 @@
+#!/usr/bin/env python3
+"""Serves AI Orchestrator's live usage (the Mac widget, formerly AI Orchestrator and Claude Switcher) to the iPhone companion app over the local network.
+
+Reads only files the widget already writes in ~/Library/Application Support/local.ai-orchestrator
+(status.json, history.jsonl, tokens-daily.json, payments.json). Never touches any Claude, Codex or
+Cursor app, profile or credential. Every figure comes from those files; nothing is estimated.
+
+  phone-feed            run the server (port 47615, Bonjour _claudeswitch._tcp)
+  phone-feed code       print the pairing code the phone asks for
+  phone-feed install    run it at login (LaunchAgent local.ai-orchestrator.phone-feed)
+  phone-feed uninstall  remove that LaunchAgent
+  phone-feed json       print the feed once
+"""
+import json, os, secrets, subprocess, sys, datetime as dt
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+PORT = 47615
+DIR = os.path.expanduser("~/Library/Application Support/local.ai-orchestrator")
+CODE_FILE = os.path.join(DIR, "phone-code")
+LABEL = "local.ai-orchestrator.phone-feed"
+PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
+
+
+def pairing_code():
+    try:
+        with open(CODE_FILE) as f:
+            c = f.read().strip()
+            if c:
+                return c
+    except FileNotFoundError:
+        pass
+    alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+    c = "".join(secrets.choice(alphabet) for _ in range(6))
+    os.makedirs(DIR, exist_ok=True)
+    fd = os.open(CODE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(c)
+    return c
+
+
+def load(name, default):
+    try:
+        with open(os.path.join(DIR, name)) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def latest_snapshots():
+    """Newest history.jsonl line per (provider, account)."""
+    out = {}
+    try:
+        with open(os.path.join(DIR, "history.jsonl")) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                out[(d.get("provider"), d.get("account"))] = d
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def recent_rise(minutes=60):
+    """Measured change in each Claude account's tightest live window over the last hour, from history.jsonl.
+    Only two real measurements of the same window count; a drop means it reset, so nothing is reported."""
+    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)
+    lines = {}
+    try:
+        with open(os.path.join(DIR, "history.jsonl")) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                    t = dt.datetime.fromisoformat(d["t"].replace("Z", "+00:00"))
+                except (ValueError, KeyError):
+                    continue
+                if t >= since:
+                    lines.setdefault((d.get("provider"), d.get("account")), []).append((t, d))
+    except FileNotFoundError:
+        pass
+    out = {}
+    for key, rows in lines.items():
+        if len(rows) < 2:
+            continue
+        (t0, first), (t1, last) = rows[0], rows[-1]
+        for name, field, label in (("5-hour", "session", "5h"), ("Weekly", "weekly", "Week")):
+            a, b = first.get(field), last.get(field)
+            if a is None or b is None or b >= 100 or b < a or (name == "5-hour" and b == 0):
+                continue
+            out[key] = {"window": label, "points": b - a, "minutes": int((t1 - t0).total_seconds() / 60)}
+            break
+    return out
+
+
+# Footprint (spec: footprint-view-spec.md). Energy, carbon and water are ESTIMATES with a low/mid/high range;
+# tokens and dollars are measured. One factor table, shared with the Mac widget.
+WH_PER_MTOK = {"input": 390, "cacheWrite": 490, "cacheRead": 39, "output": 1950}  # Simon Couch, Jan 2026
+RANGE = {"low": 0.41, "mid": 1.0, "high": 1.94}  # Hausfather: 170 kWh, range 70-330
+G_CO2_PER_KWH = 341                               # eGRID 2024 US average
+L_WATER_PER_KWH = 0.55 + 3.142                    # Li et al.: on site + power plants
+G_CO2_PER_MILE = 400                              # EPA
+HOME_KWH_PER_MONTH = 865                          # EIA 2024
+
+
+def estimate(kwh_mid):
+    r = lambda f: {k: round(f(kwh_mid * m), 4) for k, m in RANGE.items()}
+    return {"kWh": r(lambda k: k), "kgCO2e": r(lambda k: k * G_CO2_PER_KWH / 1000),
+            "waterL": r(lambda k: k * L_WATER_PER_KWH),
+            "carMiles": r(lambda k: k * G_CO2_PER_KWH / G_CO2_PER_MILE),
+            "homeMonthShare": r(lambda k: k / HOME_KWH_PER_MONTH)}
+
+
+def summarize(rows):
+    t = {k: sum(int(r.get(k, 0)) for r in rows) for k in WH_PER_MTOK}
+    total = sum(t.values())
+    kwh = sum(t[k] * WH_PER_MTOK[k] for k in t) / 1e6 / 1000
+    sessions = sum(int(r.get("sessions", 0)) for r in rows)
+    return {"tokens": total, "byType": t, "sessions": sessions,
+            "cacheReadShare": round(t["cacheRead"] / total, 4) if total else None,
+            "tokensPerSession": total // sessions if sessions else None, **estimate(kwh)}
+
+
+def extra_spend_today():
+    """Claude extra usage added since local midnight, from the widget's own snapshots (measured)."""
+    midnight = dt.datetime.combine(dt.date.today(), dt.time()).astimezone()
+    before, latest = {}, {}
+    try:
+        with open(os.path.join(DIR, "history.jsonl")) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("provider") != "claude" or "extraUsed" not in d:
+                    continue
+                t = dt.datetime.fromisoformat(d["t"].replace("Z", "+00:00"))
+                (before if t < midnight else latest)[d["account"]] = d["extraUsed"]
+    except FileNotFoundError:
+        pass
+    total = 0.0
+    for acct, now in latest.items():
+        if acct in before and now >= before[acct]:
+            total += now - before[acct]
+    return round(total, 2)
+
+
+def footprint(daily, accounts, payments):
+    today = dt.date.today()
+    month = today.strftime("%Y-%m")
+    rows = [(k.partition("|")[0], k.partition("|")[2], v) for k, v in daily.items()]
+    t_rows = [v for d, _, v in rows if d == today.isoformat()]
+    m_rows = [v for d, _, v in rows if d.startswith(month)]
+    by_acct = {}
+    for d, name, v in rows:
+        if d.startswith(month):
+            by_acct.setdefault(name, []).append(v)
+    # Same days of last month, only when the saved history reaches back to its first day.
+    first = today.replace(day=1)
+    prev_end = first - dt.timedelta(days=1)
+    prev_first = prev_end.replace(day=1)
+    days = sorted(d for d, _, _ in rows)
+    last_month = None
+    if days and days[0] <= prev_first.isoformat():
+        cutoff = prev_first.replace(day=min(today.day, prev_end.day)).isoformat()
+        last_month = summarize([v for d, _, v in rows if prev_first.isoformat() <= d <= cutoff])
+    paid_month = sum(float(p.get("amount", 0)) for p in payments if str(p.get("date", "")).startswith(month))
+    paid_today = sum(float(p.get("amount", 0)) for p in payments if str(p.get("date", "")).startswith(today.isoformat()))
+    extra_month = sum(float(a.get("extraUsed", 0)) for a in accounts if a.get("provider") == "claude")
+    return {
+        "scope": "Claude Code on this Mac",
+        "historySince": days[0] if days else None,
+        "today": summarize(t_rows),
+        "month": summarize(m_rows),
+        "byAccount": [{"name": n, **summarize(v)} for n, v in sorted(by_acct.items())],
+        "lastMonthSameDays": last_month,
+        "paid": {"todayLedger": round(paid_today, 2), "monthLedger": round(paid_month, 2),
+                 "todayClaudeExtra": extra_spend_today(), "monthClaudeExtra": round(extra_month, 2)},
+        "daily": footprint_daily(daily, payments),
+        "tokensSince": min((k[:10] for k in daily), default=None),
+        "extraSince": first_snapshot_day(),
+        "factors": {"whPerMTok": WH_PER_MTOK, "low": RANGE["low"], "high": RANGE["high"],
+                    "codexWhPerMTok": {"low": 22, "mid": 53, "high": 103},
+                    "gCO2ePerKWh": G_CO2_PER_KWH, "waterLPerKWh": L_WATER_PER_KWH,
+                    "gCO2PerMile": G_CO2_PER_MILE, "homeKWhPerMonth": HOME_KWH_PER_MONTH},
+        "sources": "Energy per token: Simon Couch (Jan 2026); range: Zeke Hausfather; carbon: EPA eGRID 2024; "
+                   "water: Li et al.; car: EPA; home: EIA 2024.",
+    }
+
+
+def extra_by_day():
+    """Claude extra usage added per local day, from consecutive widget snapshots (measured).
+    A drop means a new billing month started, so the new value counts as that day's spend."""
+    prev, out = {}, {}
+    try:
+        with open(os.path.join(DIR, "history.jsonl")) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("provider") != "claude" or "extraUsed" not in d:
+                    continue
+                day = _local_day(d.get("t", ""))
+                v, acct = float(d["extraUsed"]), d.get("account")
+                if acct not in prev and day and v > 0:
+                    # First snapshot: Claude's figure is month-to-date, so it belongs to that month.
+                    # The day it was spent isn't known; it is counted on the 1st (the app says so).
+                    first = day[:8] + "01"
+                    out[first] = round(out.get(first, 0) + v, 2)
+                elif acct in prev and day:
+                    delta = v - prev[acct] if v >= prev[acct] else v
+                    if delta > 0:
+                        out[day] = round(out.get(day, 0) + delta, 2)
+                prev[acct] = v
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def first_snapshot_day():
+    try:
+        with open(os.path.join(DIR, "history.jsonl")) as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("provider") == "claude" and "extraUsed" in d:
+                    return _local_day(d.get("t", ""))
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def footprint_daily(daily, payments):
+    """Per-day measured inputs so the phone can add up any date range with the same factors."""
+    days = {}
+    for key, v in daily.items():
+        day = key.partition("|")[0]
+        d = days.setdefault(day, {"day": day, **dict.fromkeys(TYPES, 0), "sessions": 0, "codexTokens": 0,
+                                  "claudeExtra": 0.0, "ledger": 0.0})
+        for k in TYPES:
+            d[k] += int(v.get(k, 0))
+        d["sessions"] += int(v.get("sessions", 0))
+    def at(day):
+        return days.setdefault(day, {"day": day, **dict.fromkeys(TYPES, 0), "sessions": 0, "codexTokens": 0,
+                                     "claudeExtra": 0.0, "ledger": 0.0})
+    for c in codex_threads():
+        at(c["first"])["codexTokens"] += c["tokens"]
+    for day, v in extra_by_day().items():
+        at(day)["claudeExtra"] = v
+    for p in payments:
+        day = str(p.get("date", ""))[:10]
+        if day:
+            at(day)["ledger"] = round(at(day)["ledger"] + float(p.get("amount", 0)), 2)
+    return [days[d] for d in sorted(days)]
+
+
+def merge_footprint(mine, mac):
+    """The Mac widget's own estimates win where it has them (so both screens match); the phone-only
+    extras (paid, cache share, sessions, comparisons) are kept from this feed."""
+    if not isinstance(mac, dict):
+        return mine
+    for period in ("today", "month"):
+        src = mac.get(period) or {}
+        for k in ("tokens", "kWh", "kgCO2e", "waterL"):
+            if k in src:
+                mine[period][k] = src[k]
+        if "kgCO2e" in src:
+            mine[period]["carMiles"] = {k: round(v * 1000 / G_CO2_PER_MILE, 4) for k, v in src["kgCO2e"].items()}
+        if "kWh" in src:
+            mine[period]["homeMonthShare"] = {k: round(v / HOME_KWH_PER_MONTH, 4) for k, v in src["kWh"].items()}
+    if "codex" in mac:
+        mine["codex"] = mac["codex"]
+    if isinstance(mac.get("factors"), dict):   # use the Mac's factor table so ranges match it
+        mine["factors"].update({k: v for k, v in mac["factors"].items() if k in mine["factors"]})
+    mine["fromMac"] = True
+    return mine
+
+
+# Token history per project and session. Claude Code deletes transcripts after ~30 days, so totals are
+# saved in projects-history.json and kept for good. Read incrementally (byte offsets), deduplicated by
+# message id like the widget's TokenCounter. Codex threads come from its own read-only thread database.
+import glob, hashlib, sqlite3, threading
+HIST_FILE = os.path.join(DIR, "projects-history.json")
+HIST_LOCK = threading.Lock()
+TYPES = ("input", "output", "cacheWrite", "cacheRead")
+
+
+def _empty_hist():
+    return {"version": 1, "files": {}, "seen": [], "sessions": {}, "projectDays": {}}
+
+
+def load_hist():
+    try:
+        with open(HIST_FILE) as f:
+            h = json.load(f)
+            if h.get("version") == 1:
+                return h
+    except Exception:
+        pass
+    return _empty_hist()
+
+
+HIST = load_hist()
+SEEN = set(HIST.get("seen", []))
+
+
+def project_group(name):
+    """Worktrees count toward their repo; Claude app scratch folders are grouped together."""
+    if "/.claude/worktrees/" in name:
+        return name.split("/.claude/worktrees/")[0]
+    if "/scratch-workspaces/" in name:
+        acct = name.split("/Application Support/")[-1].split("/")[0].replace("Claude-", "")
+        return f"Claude app scratch ({acct})" if acct and acct != "Claude" else "Claude app scratch"
+    return name
+
+
+def clean_title(t):
+    if not t:
+        return None
+    t = __import__("re").sub(r'@"[^"]*"\s*', "", t).strip()
+    if t.startswith("[Request interrupted") or t.startswith("# Files pasted"):
+        return None
+    return t[:90] or None
+
+
+def short_project(cwd):
+    home = os.path.expanduser("~")
+    return ("~" + cwd[len(home):]) if cwd and cwd.startswith(home) else (cwd or "Unknown")
+
+
+def _local_day(ts):
+    try:
+        return dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().date().isoformat()
+    except Exception:
+        return None
+
+
+def _title_from(msg):
+    c = msg.get("content")
+    if isinstance(c, list):
+        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+    if not isinstance(c, str):
+        return None
+    c = " ".join(c.split())
+    if c.startswith("<wake") and "<message" in c:   # Claude project threads: use the person's message
+        m = __import__("re").search(r"<message[^>]*>(.*?)</message>", c)
+        c = m.group(1).strip() if m else ""
+    if not c or c.startswith("<") or c.startswith("Caveat:"):
+        return None
+    return c[:2000]
+
+
+def scan_claude():
+    root = os.path.expanduser("~/.claude/projects")
+    files = HIST["files"]
+    for path in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        rec = files.get(path, {"offset": 0})
+        if size < rec["offset"]:
+            rec = {"offset": 0}          # file was rewritten
+        if size == rec["offset"]:
+            continue
+        with open(path, "rb") as f:
+            f.seek(rec["offset"])
+            data = f.read()
+        end = data.rfind(b"\n") + 1      # only complete lines
+        for raw in data[:end].splitlines():
+            if b'"usage"' not in raw and b'"type":"user"' not in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            sid = d.get("sessionId")
+            if not sid:
+                continue
+            sess = HIST["sessions"].setdefault(sid, {"project": short_project(d.get("cwd")), "title": None,
+                                                     "first": None, "last": None, "tokens": dict.fromkeys(TYPES, 0),
+                                                     "models": {}, "days": {}})
+            if d.get("cwd") and sess["project"] == "Unknown":
+                sess["project"] = short_project(d["cwd"])
+            if d.get("type") == "user" and not sess["title"] and not d.get("isMeta") and not d.get("isSidechain"):
+                sess["title"] = clean_title(_title_from(d.get("message") or {}))
+            msg = d.get("message") or {}
+            u = msg.get("usage") if d.get("type") == "assistant" else None
+            if not u:
+                continue
+            key = msg.get("id") or d.get("requestId")
+            if key:
+                h = hashlib.sha1(key.encode()).hexdigest()[:12]
+                if h in SEEN:
+                    continue
+                SEEN.add(h)
+            t = {"input": int(u.get("input_tokens") or 0), "output": int(u.get("output_tokens") or 0),
+                 "cacheWrite": int(u.get("cache_creation_input_tokens") or 0),
+                 "cacheRead": int(u.get("cache_read_input_tokens") or 0)}
+            day = _local_day(d.get("timestamp", ""))
+            if not day:
+                continue
+            for k in TYPES:
+                sess["tokens"][k] += t[k]
+            total = sum(t.values())
+            sess["days"][day] = sess["days"].get(day, 0) + total
+            model = msg.get("model") or "unknown"
+            sess["models"][model] = sess["models"].get(model, 0) + total
+            sess["first"] = min(filter(None, [sess["first"], day]))
+            sess["last"] = max(filter(None, [sess["last"], day]))
+            pd = HIST["projectDays"].setdefault(sess["project"] + "|" + day, dict.fromkeys(TYPES, 0))
+            for k in TYPES:
+                pd[k] += t[k]
+        rec["offset"] += end
+        files[path] = rec
+
+
+def codex_threads():
+    homes = [os.path.expanduser("~/.codex")] + glob.glob(os.path.expanduser("~/Library/Application Support/Codex-*/codex-home"))
+    out = []
+    for home in homes:
+        db = os.path.join(home, "state_5.sqlite")
+        if not os.path.exists(db):
+            continue
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+            rows = con.execute("select id, cwd, coalesce(nullif(name, ''), nullif(preview, ''), title), tokens_used, created_at, updated_at, model from threads "
+                               "where tokens_used > 0").fetchall()
+            con.close()
+        except Exception:
+            continue
+        for tid, cwd, title, tok, created, updated, model in rows:
+            out.append({"id": tid, "project": short_project(cwd), "title": clean_title(" ".join((title or "").split())),
+                        "tokens": int(tok),
+                        "first": dt.datetime.fromtimestamp(created).date().isoformat(),
+                        "last": dt.datetime.fromtimestamp(updated).date().isoformat(), "model": model})
+    return out
+
+
+def save_hist():
+    HIST["seen"] = list(SEEN)
+    tmp = HIST_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(HIST, f)
+    os.replace(tmp, HIST_FILE)
+
+
+def refresh_history():
+    with HIST_LOCK:
+        scan_claude()
+        save_hist()
+
+
+def history_loop():
+    while True:
+        try:
+            refresh_history()
+        except Exception as e:
+            sys.stderr.write(f"history scan failed: {e}\n")
+        __import__("time").sleep(600)
+
+
+def projects_feed():
+    """Where tokens went: by project and by session/thread, for the last 30 days and all saved history."""
+    today = dt.date.today()
+    since30 = (today - dt.timedelta(days=29)).isoformat()
+    with HIST_LOCK:
+        proj = {}
+        for key, t in HIST["projectDays"].items():
+            name, _, day = key.rpartition("|")
+            name = project_group(name)
+            p = proj.setdefault(name, {"name": name, "tool": "Claude Code", "tokens30": 0, "tokensAll": 0,
+                                        "byType30": dict.fromkeys(TYPES, 0), "days": {}})
+            total = sum(t.values())
+            p["tokensAll"] += total
+            if day >= since30:
+                p["tokens30"] += total
+                for k in TYPES:
+                    p["byType30"][k] += t[k]
+                p["days"][day] = p["days"].get(day, 0) + total
+        sessions = []
+        for sid, s in HIST["sessions"].items():
+            total = sum(s["tokens"].values())
+            if not total:
+                continue
+            t30 = sum(v for d, v in s["days"].items() if d >= since30)
+            sessions.append({"id": sid, "tool": "Claude Code", "project": project_group(s["project"]), "title": s["title"],
+                             "first": s["first"], "last": s["last"], "tokens": total, "tokens30": t30,
+                             "byType": s["tokens"],
+                             "model": max(s["models"], key=s["models"].get) if s["models"] else None})
+        since = min((d for k in HIST["projectDays"] for d in [k.rpartition("|")[2]]), default=None)
+    for c in codex_threads():
+        c30 = c["tokens"] if c["first"] >= since30 else 0   # Codex counts a thread on its start day
+        p = proj.setdefault("Codex · " + c["project"], {"name": c["project"], "tool": "Codex", "tokens30": 0,
+                                                       "tokensAll": 0, "byType30": None, "days": {}})
+        p["tokensAll"] += c["tokens"]
+        p["tokens30"] += c30
+        if c30:
+            p["days"][c["first"]] = p["days"].get(c["first"], 0) + c30
+        sessions.append({"id": c["id"], "tool": "Codex", "project": c["project"], "title": c["title"],
+                         "first": c["first"], "last": c["last"], "tokens": c["tokens"], "tokens30": c30,
+                         "byType": None, "model": c["model"]})
+    projects = sorted(proj.values(), key=lambda p: (p["tokens30"], p["tokensAll"]), reverse=True)
+    for p in projects:
+        p["days"] = [{"day": d, "tokens": p["days"][d]} for d in sorted(p["days"])]
+    sessions.sort(key=lambda s: (s["tokens30"], s["tokens"]), reverse=True)
+    return {"savedSince": since, "projects": projects[:40], "sessions": sessions[:60],
+            "note": "Claude Code by message day; Codex threads counted on their start day (Codex reports one total per thread)."}
+
+
+def read_budget():
+    try:
+        r = subprocess.run(["/usr/bin/defaults", "read", "local.ai-orchestrator", "extraBudget"],
+                           capture_output=True, text=True, timeout=3)
+        v = float(r.stdout.strip())
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+
+def strip_income(cc):
+    """Income stays on the Mac: drop any revenue/income field before the feed leaves it."""
+    if isinstance(cc, dict):
+        return {k: strip_income(v) for k, v in cc.items() if "revenue" not in k.lower() and "income" not in k.lower()}
+    if isinstance(cc, list):
+        return [strip_income(x) for x in cc]
+    return cc
+
+
+def build_feed():
+    status = load("status.json", {})
+    snaps = latest_snapshots()
+    rises = recent_rise()
+    accounts = []
+    for t in status.get("targets", []):
+        provider, _, slug = t.get("id", "").partition(":")
+        a = dict(t)
+        a["provider"] = provider
+        s = snaps.get((provider, slug))
+        if (provider, slug) in rises:
+            a["recentRise"] = rises[(provider, slug)]
+        if s:
+            a["snapshotAt"] = s.get("t")
+            for k in ("limits", "extraUsed", "extraLimit", "currency"):
+                if k in s:
+                    a[k] = s[k]
+        accounts.append(a)
+
+    # Claude Code tokens per account: today and the last 7 days, plus a 14-day series.
+    daily = load("tokens-daily.json", {})
+    today = dt.date.today()
+    week = {(today - dt.timedelta(days=i)).isoformat() for i in range(7)}
+    series_days = [(today - dt.timedelta(days=i)).isoformat() for i in range(13, -1, -1)]
+    per, series = {}, {d: 0 for d in series_days}
+    for key, v in daily.items():
+        day, _, name = key.partition("|")
+        total = sum(int(v.get(k, 0)) for k in ("input", "output", "cacheWrite", "cacheRead"))
+        p = per.setdefault(name, {"name": name, "todayTokens": 0, "weekTokens": 0, "weekValue": 0.0, "weekSessions": 0})
+        if day == today.isoformat():
+            p["todayTokens"] += total
+        if day in week:
+            p["weekTokens"] += total
+            p["weekValue"] += float(v.get("value", 0))
+            p["weekSessions"] += int(v.get("sessions", 0))
+        if day in series:
+            series[day] += total
+
+    # Payments logged in Connections & spend, this calendar month, by provider.
+    month = today.strftime("%Y-%m")
+    by_provider = {}
+    for p in load("payments.json", []):
+        if str(p.get("date", "")).startswith(month):
+            by_provider[p.get("provider", "Other")] = by_provider.get(p.get("provider", "Other"), 0.0) + float(p.get("amount", 0))
+
+    return {
+        "version": 1,
+        "updated": status.get("updated"),
+        "served": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pick": status.get("pick"),
+        "accounts": accounts,
+        "claudeCode": sorted(per.values(), key=lambda p: p["name"]),
+        "tokensByDay": [{"day": d, "tokens": series[d]} for d in series_days],
+        # AI Orchestrator's day-by-day record (tokens, value and limit use by account and model), newest first.
+        "usageDays": load("usage-daily.json", [])[:120],
+        "paymentsThisMonth": {"month": month, "byProvider": by_provider, "total": round(sum(by_provider.values()), 2)},
+        "projects": projects_feed(),
+        # Budget standing, ranked ideas and the latest manager brief, exactly as AI Orchestrator wrote them.
+        "commandCenter": strip_income(status.get("commandCenter")),
+        # Plans tab subscriptions and expected charges (no emails or card details leave the Mac).
+        "plans": [{k: v for k, v in p.items() if k not in ("email", "billingURL")} for p in status.get("plans") or []],
+        "upcomingCharges": status.get("upcomingCharges") or [],
+        "budget": {"monthlyClaudeExtra": read_budget(), "daysInMonth": (dt.date.today().replace(day=28) + dt.timedelta(days=4)).replace(day=1).__sub__(dt.timedelta(days=1)).day, "day": dt.date.today().day},
+        # The Mac widget's own footprint wins when status.json carries one, so both screens match.
+        "footprint": merge_footprint(footprint(daily, accounts, load("payments.json", [])), status.get("footprint")),
+    }
+
+
+PAIR_LOCK = __import__("threading").Lock()
+
+
+def ask_to_pair(device):
+    """One-time approval on the Mac: a dialog with Allow / Don't Allow. Returns True when allowed."""
+    name = "".join(c for c in device if c.isalnum() or c in " -_'’.")[:40] or "An iPhone"
+    script = (f'display dialog "{name} wants to connect to AI Orchestrator on this Mac." '
+              'with title "AI Orchestrator" buttons {"Don’t Allow", "Allow"} default button "Allow" '
+              'giving up after 120 with icon note')
+    if not PAIR_LOCK.acquire(blocking=False):
+        return False
+    try:
+        r = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=130)
+        return "button returned:Allow" in r.stdout and "gave up:true" not in r.stdout
+    except Exception:
+        return False
+    finally:
+        PAIR_LOCK.release()
+
+
+INBOX_LOCK = threading.Lock()
+
+
+def take_note(note):
+    """A note the phone filed with Claude. Ideas go straight into ideas.json (as bin/idea does; AI Orchestrator
+    reloads it). Expenses and plan changes go to phone-inbox.json, which AI Orchestrator imports into the
+    ledger and Plans. Returns where it went."""
+    nid, kind = str(note.get("id", "")).upper(), note.get("kind")
+    if not nid or kind not in ("expense", "planChange", "idea"):
+        raise ValueError("not a note AI Orchestrator can file")
+    now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with INBOX_LOCK:
+        if kind == "idea":
+            i = note.get("idea") or {}
+            if not str(i.get("title", "")).strip():
+                raise ValueError("idea has no title")
+            ideas = load("ideas.json", [])
+            if not any(str(x.get("id", "")).upper() == nid for x in ideas):
+                clamp = lambda v, lo, hi, d: max(lo, min(hi, int(v))) if isinstance(v, (int, float)) else d
+                ideas.insert(0, {"id": nid, "title": str(i["title"]).strip()[:200], "notes": str(i.get("notes") or note.get("text") or "")[:2000],
+                                 "value": clamp(i.get("value"), 1, 5, 3), "effort": clamp(i.get("effort"), 1, 5, 3),
+                                 "size": clamp(i.get("size"), 1, 3, 2), "status": "inbox", "created": now, "source": "phone"})
+                write_json("ideas.json", ideas)
+            return "Ideas"
+        if kind == "expense" and not isinstance((note.get("expense") or {}).get("amount"), (int, float)):
+            raise ValueError("expense has no amount")
+        inbox = load("phone-inbox.json", [])
+        if not any(str(x.get("id", "")).upper() == nid for x in inbox):
+            keep = {k: note.get(k) for k in ("kind", "text", "created", "expense", "planChange")}
+            inbox.append({"id": nid, "received": now, **keep})
+            write_json("phone-inbox.json", inbox)
+        return "the ledger" if kind == "expense" else "Plans"
+
+
+def write_json(name, obj):
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=DIR)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f, indent=2, sort_keys=True)
+    os.replace(tmp, os.path.join(DIR, name))
+
+
+ORCH_LOCK = threading.Lock()
+
+
+RUN_KEYS = ("id", "request", "folder", "mode", "scope", "status", "started", "ended", "branch", "changed", "merged", "message", "source")
+STEP_KEYS = ("name", "target", "scope", "status", "note", "roomBefore", "reason", "model", "threadId")
+
+
+def _run(r, output=False):
+    steps = [{k: s.get(k) for k in STEP_KEYS} | ({"output": (s.get("output") or "")[-6000:]} if output else {}) for s in r.get("steps", [])]
+    # "open": the run's worktree and branch are still there, so it can be merged or discarded.
+    return {k: r.get(k) for k in RUN_KEYS} | {"steps": steps, "open": bool(r.get("worktree"))}
+
+
+def orch_view():
+    """The phone's board: projects, accounts with their room, the T3 threads (latest message cut short) and recent
+    runs without their transcripts. A thread's full text and changed files come from /orch/thread when it's opened."""
+    state = load("orchestrator-state.json", {})
+    state["board"] = [t | {"latest": (t.get("latest") or "")[:160]} for t in state.get("board", [])]
+    return {"state": state, "runs": [_run(r) for r in load("orchestrator-runs.json", [])[:30]]}
+
+
+def _numstat(r):
+    """Changed files with lines added and removed: from git while the run's branch exists, else from its saved --stat."""
+    root, base, branch = r.get("repoRoot"), r.get("baseCommit"), r.get("branch")
+    files = []
+    if root and base and branch and os.path.isdir(root):
+        try:
+            out = subprocess.run(["/usr/bin/git", "-C", root, "diff", "--numstat", base, branch], capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                a, d, path = (line.split("\t", 2) + ["", "", ""])[:3]
+                if path:
+                    files.append({"path": path, "added": int(a) if a.isdigit() else 0, "removed": int(d) if d.isdigit() else 0})
+            if files:
+                return files
+        except Exception:
+            pass
+    for line in (r.get("changed") or "").splitlines():
+        if "|" not in line:
+            continue
+        path, rest = [x.strip() for x in line.split("|", 1)]
+        bits = rest.split()
+        total = int(bits[0]) if bits and bits[0].isdigit() else 0
+        marks = bits[1] if len(bits) > 1 else ""
+        plus, minus = marks.count("+"), marks.count("-")
+        added = round(total * plus / (plus + minus)) if plus + minus else 0
+        files.append({"path": path, "added": added, "removed": total - added})
+    return files
+
+
+def orch_thread(tid):
+    """One thread or run, loaded when the phone opens it: the full latest message, the run's steps with output, changed files."""
+    tid = (tid or "").strip()
+    state = load("orchestrator-state.json", {})
+    thread = next((t for t in state.get("board", []) if t.get("id") == tid), None)
+    rid = ((thread or {}).get("runId") or tid).upper()
+    run = next((r for r in load("orchestrator-runs.json", []) if str(r.get("id", "")).upper() == rid), None)
+    if not thread and not run:
+        return None
+    return {"thread": thread, "run": _run(run, output=True) if run else None, "files": _numstat(run) if run else []}
+
+
+def orch_request(raw, headers):
+    """A signed request from the phone: HMAC-SHA256 over "<timestamp>\n<body>" keyed with the pairing code,
+    at most 5 minutes old, each id used once. It's only queued; AI Orchestrator checks the folder and scope."""
+    import hmac
+    ts = (headers.get("X-Timestamp") or "").strip()
+    sig = (headers.get("X-Signature") or "").strip().lower()
+    want = hmac.new(pairing_code().encode(), ts.encode() + b"\n" + raw, hashlib.sha256).hexdigest()
+    if not ts or not hmac.compare_digest(sig, want):
+        raise PermissionError("bad signature")
+    try:
+        age = abs(dt.datetime.now(dt.timezone.utc).timestamp() - float(ts))
+    except ValueError:
+        raise PermissionError("bad timestamp")
+    if age > 300:
+        raise PermissionError("request too old; check the phone's clock")
+    req = json.loads(raw)
+    rid, kind = str(req.get("id", "")).upper(), req.get("kind")
+    if len(rid) != 36 or kind not in ("run", "stop", "board", "merge", "discard"):
+        raise ValueError("not a request AI Orchestrator understands")
+    item = {"id": rid, "kind": kind, "received": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    if kind == "run":
+        text = str(req.get("request") or "").strip()
+        if not text or len(text) > 20000:
+            raise ValueError("empty or too long")
+        # Allowed folders, plus the Mac's own project list (the one window's sidebar). Edit still needs the Mac's one-time OK.
+        state = load("orchestrator-state.json", {})
+        folders = [f.get("path") for f in state.get("folders", [])] + [p.get("path") for p in state.get("projects", [])]
+        if req.get("folder") not in folders:
+            raise ValueError("that folder isn't one of the Mac's projects")
+        item.update(request=text, folder=req["folder"], mode=req.get("mode") if req.get("mode") in ("auto", "direct") else "auto",
+                    scope=req.get("scope") if req.get("scope") in ("read", "edit") else "read")
+        if req.get("target"):
+            item["target"] = str(req["target"])[:200]
+        if req.get("model"):
+            item["model"] = str(req["model"])[:100]
+        if req.get("ask") is True:
+            item["ask"] = True
+    elif kind == "board":
+        # An Overview action on one T3 thread; AI Orchestrator checks the thread is on its board.
+        if req.get("action") not in ("approve", "decline", "stop", "reassign", "reply"):
+            raise ValueError("unknown action")
+        item.update(thread=str(req.get("thread", ""))[:300], action=req["action"], text=str(req.get("text") or "")[:8000])
+    else:
+        item["runId"] = str(req.get("runId", "")).upper()[:36]
+    with ORCH_LOCK:
+        cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        inbox = [x for x in load("orchestrator-inbox.json", []) if x.get("received", "") >= cutoff]
+        if any(x.get("id") == rid for x in inbox):
+            raise PermissionError("already received")
+        inbox.append(item)
+        write_json("orchestrator-inbox.json", inbox)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        url = urlparse(self.path)
+        if url.path == "/orch":
+            n = int(self.headers.get("Content-Length") or 0)
+            if not 0 < n <= 65536:
+                return self.send(413, {"error": "too large"})
+            try:
+                orch_request(self.rfile.read(n), self.headers)
+                return self.send(200, {"ok": True})
+            except PermissionError as e:
+                return self.send(401, {"error": str(e)})
+            except (ValueError, TypeError, KeyError) as e:
+                return self.send(400, {"error": str(e)})
+        if url.path != "/inbox":
+            return self.send(404, {"error": "not found"})
+        if not secrets.compare_digest((self.headers.get("X-Pairing-Code") or "").strip().upper(), pairing_code()):
+            return self.send(401, {"error": "wrong pairing code"})
+        n = int(self.headers.get("Content-Length") or 0)
+        if not 0 < n <= 65536:
+            return self.send(413, {"error": "too large"})
+        try:
+            return self.send(200, {"ok": True, "where": take_note(json.loads(self.rfile.read(n)))})
+        except (ValueError, TypeError, KeyError) as e:
+            return self.send(400, {"error": str(e)})
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        if url.path == "/pair":
+            device = parse_qs(url.query).get("device", ["An iPhone"])[0]
+            if ask_to_pair(device):
+                return self.send(200, {"code": pairing_code()})
+            return self.send(403, {"error": "not allowed on the Mac"})
+        key = self.headers.get("X-Pairing-Code") or parse_qs(url.query).get("code", [""])[0]
+        if url.path not in ("/feed", "/orch", "/orch/thread"):
+            return self.send(404, {"error": "not found"})
+        if not secrets.compare_digest(key.strip().upper(), pairing_code()):
+            return self.send(401, {"error": "wrong pairing code"})
+        if url.path == "/orch/thread":
+            d = orch_thread(parse_qs(url.query).get("id", [""])[0])
+            return self.send(200, d) if d else self.send(404, {"error": "no such thread"})
+        self.send(200, orch_view() if url.path == "/orch" else build_feed())
+
+    def send(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+def serve():
+    pairing_code()
+    threading.Thread(target=history_loop, daemon=True).start()
+    bonjour = subprocess.Popen(["/usr/bin/dns-sd", "-R", "AI Orchestrator", "_claudeswitch._tcp", "local", str(PORT)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    finally:
+        bonjour.terminate()
+
+
+def install():
+    # launchd can't read ~/Downloads (privacy protection), so run a copy from the data folder.
+    me = os.path.join(DIR, "phone-feed.py")
+    os.makedirs(DIR, exist_ok=True)
+    with open(os.path.realpath(__file__)) as src, open(me, "w") as dst:
+        dst.write(src.read())
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{LABEL}</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>{me}</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>
+"""
+    os.makedirs(os.path.dirname(PLIST), exist_ok=True)
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], stderr=subprocess.DEVNULL)
+    with open(PLIST, "w") as f:
+        f.write(plist)
+    for attempt in range(5):   # bootout finishes asynchronously
+        if subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", PLIST], stderr=subprocess.DEVNULL).returncode == 0:
+            break
+        __import__("time").sleep(1)
+    print(f"Running at login. Pairing code: {pairing_code()}")
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
+    if cmd == "code":
+        print(pairing_code())
+    elif cmd == "json":
+        print(json.dumps(build_feed(), indent=2))
+    elif cmd == "orch-json":
+        print(json.dumps(orch_view(), indent=2))
+    elif cmd == "install":
+        install()
+    elif cmd == "uninstall":
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"])
+        if os.path.exists(PLIST):
+            os.remove(PLIST)
+    else:
+        serve()

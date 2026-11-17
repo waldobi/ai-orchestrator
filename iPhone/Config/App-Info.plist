@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSBonjourServices</key>
+	<array><string>_claudeswitch._tcp</string></array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Connects to AI Orchestrator on your Mac over Wi-Fi to show its Inbox and usage.</string>
+	<key>UIBackgroundModes</key>
+	<array><string>fetch</string></array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array><string>local.ai-orchestrator.phone.refresh</string></array>
+	<key>CFBundleURLTypes</key>
+	<array><dict>
+		<key>CFBundleURLName</key><string>local.ai-orchestrator.phone</string>
+		<key>CFBundleURLSchemes</key><array><string>aiorchestrator</string></array>
+	</dict></array>
+	<key>NSAppTransportSecurity</key>
+	<dict><key>NSAllowsLocalNetworking</key><true/></dict>
+</dict>
+</plist>

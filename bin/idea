@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Add an idea to Burn Rate's backlog from any terminal or Claude session.
+
+  idea "Build the invoice importer"                  add with default scores
+  idea "Ship the iPhone widget" -v 5 -e 2 -s 1 -n "notes…"
+  idea --list                                        show the backlog, best first
+
+value 1–5 (how much it matters), effort 1–5 (how much work), size 1–3 (tokens: S/M/L).
+Writes ~/Library/Application Support/local.ai-orchestrator/ideas.json, which Burn Rate's Ideas
+window reloads when it changes.
+"""
+import argparse, datetime as dt, json, os, sys, tempfile, uuid
+
+FILE = os.path.expanduser("~/Library/Application Support/local.ai-orchestrator/ideas.json")
+
+
+def load():
+    try:
+        with open(FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+
+def save(ideas):
+    os.makedirs(os.path.dirname(FILE), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(FILE))
+    with os.fdopen(fd, "w") as f:
+        json.dump(ideas, f, indent=2, sort_keys=True)
+    os.replace(tmp, FILE)
+
+
+def score(i):
+    return (i.get("value", 3) * 2) / (i.get("effort", 3) + i.get("size", 2))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("title", nargs="?")
+    p.add_argument("-n", "--notes", default="")
+    p.add_argument("-v", "--value", type=int, default=3, choices=range(1, 6))
+    p.add_argument("-e", "--effort", type=int, default=3, choices=range(1, 6))
+    p.add_argument("-s", "--size", type=int, default=2, choices=range(1, 4))
+    p.add_argument("--list", action="store_true")
+    a = p.parse_args()
+    ideas = load()
+    if a.list or not a.title:
+        live = [i for i in ideas if i.get("status") not in ("done", "dropped")]
+        live.sort(key=lambda i: (i.get("managerRank") is None, i.get("managerRank") or 0, -score(i)))
+        for i in live:
+            rank = f"#{i['managerRank']}" if i.get("managerRank") else "  "
+            print(f"{rank:>4} {score(i):4.1f}  [{i.get('status', 'inbox')}] {i['title']}")
+        if not live:
+            print("No open ideas yet.")
+        return
+    ideas.insert(0, {
+        "id": str(uuid.uuid4()).upper(), "title": a.title.strip(), "notes": a.notes,
+        "value": a.value, "effort": a.effort, "size": a.size, "status": "inbox",
+        "created": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "source": "cli",
+    })
+    save(ideas)
+    print(f"Added: {a.title.strip()} (score {score(ideas[0]):.1f})")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
