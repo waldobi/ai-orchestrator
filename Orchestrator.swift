@@ -103,7 +103,8 @@ enum OrchTargets {
     }()
 
     static func which(_ name: String) -> String? {
-        binDirs.map { $0 + "/" + name }.first { FileManager.default.isExecutableFile(atPath: $0) }
+        if Demo.on { return nil }   // demo mode never runs real agents or the T3 server
+        return binDirs.map { $0 + "/" + name }.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     /// The signed-in email of a Claude CLI config (`oauthAccount.emailAddress`, not a secret; the same field `ai-route` reads).

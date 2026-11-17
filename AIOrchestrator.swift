@@ -23,6 +23,35 @@ import WebKit
 
 // MARK: - Paths & small helpers
 
+/// Demo mode (`AIO_DEMO=1`): made-up usage for every account instead of reading claude.ai, Codex logs or
+/// cursor.com, for screenshots and trying the app without signing in. Run it with a throwaway home folder
+/// (`CFFIXED_USER_HOME=/tmp/aio-demo`) so nothing real is read. See scripts/demo.sh.
+enum Demo {
+    static let on = ProcessInfo.processInfo.environment["AIO_DEMO"] == "1"
+    private static func iso(_ hours: Double) -> String {
+        let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.string(from: Date().addingTimeInterval(hours * 3600))
+    }
+    private static let readings: [String: (Double, Double, Double, Double)] = [   // 5h %, resets in h, weekly %, resets in h
+        "main": (38, 2.4, 61, 70), "work": (12, 4.1, 27, 115), "side": (91, 0.6, 84, 30)]
+    static func claudeJSON(_ slug: String) -> String {
+        let r = readings[slug] ?? (20, 3, 40, 90)
+        let obj: [String: Any] = ["status": "ok", "email": "\(slug)@example.com",
+            "usage": ["five_hour": ["utilization": r.0, "resets_at": iso(r.1)],
+                      "seven_day": ["utilization": r.2, "resets_at": iso(r.3)]],
+            "org": ["rate_limit_tier": "default_claude_max_5x", "billing_type": "stripe_subscription", "capabilities": ["chat", "claude_max"]]]
+        let data = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()
+        return String(data: data, encoding: .utf8) ?? "{}"
+    }
+    static var codex: CodexUsage {
+        CodexUsage(plan: "plus", weeklyPercent: 46, weeklyResets: Date().addingTimeInterval(52 * 3600), shortPercent: 22,
+                   shortResets: Date().addingTimeInterval(3 * 3600), tokensWeek: 4_200_000, sessionsWeek: 18, measuredAt: Date())
+    }
+    static var cursor: CursorUsage {
+        CursorUsage(plan: "pro", percent: 34, used: 6.8, limit: 20, cycleEnd: Date().addingTimeInterval(12 * 86_400))
+    }
+}
+
 enum Paths {
     static let claudeApp = URL(fileURLWithPath: "/Applications/Claude.app")
     static let appSupport = FileManager.default.homeDirectoryForCurrentUser
@@ -772,6 +801,7 @@ final class UsageFetcher: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindow
     }
 
     func refresh() {
+        if Demo.on { handle(Demo.claudeJSON(account.slug), allowRetry: false); return }
         if !importedThisRun {
             importedThisRun = true
             importCookies { [weak self] in self?.runFetch(allowRetry: true) }
@@ -3098,7 +3128,7 @@ extension AccountStore {
         let codex = others.filter { $0.app == .codex }
         CodexReader.queue.async {
             var out: [String: CodexUsage] = [:]
-            for o in codex { if let u = CodexReader.read(home: o.codexHome, force: force) { out[o.id] = u } }
+            for o in codex { if let u = Demo.on ? Demo.codex : CodexReader.read(home: o.codexHome, force: force) { out[o.id] = u } }
             DispatchQueue.main.async {
                 self.codexUsage = out
                 self.codexChecked = true
@@ -3267,6 +3297,7 @@ enum CursorReader {
 extension AccountStore {
     func refreshCursor() {
         for o in others where o.app == .cursor {
+            if Demo.on { cursorUsage[o.id] = Demo.cursor; otherProblem[o.id] = nil; continue }
             CursorReader.fetch(dataDir: o.dataDir) { u, problem in
                 DispatchQueue.main.async {
                     self.cursorUsage[o.id] = u
@@ -11521,14 +11552,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             PlanStore.shared.perform(action, card, store: self.store)
         }
 
-        // Start at login by default (once); the right-click menu can turn it off again.
-        // "loginItemBurnRate": re-registered once after the rename, since the login item pointed at the old app bundle.
-        // "loginItemAIOrchestrator": the same once more for the move to AI Orchestrator.app (Nov 7).
-        if !UserDefaults.standard.bool(forKey: "loginItemDefaulted") || !UserDefaults.standard.bool(forKey: "loginItemBurnRate")
-            || !UserDefaults.standard.bool(forKey: "loginItemAIOrchestrator") {
+        // Start at login by default (once); the right-click menu can turn it off again. Never in demo mode.
+        if !Demo.on, !UserDefaults.standard.bool(forKey: "loginItemDefaulted") {
             UserDefaults.standard.set(true, forKey: "loginItemDefaulted")
-            UserDefaults.standard.set(true, forKey: "loginItemBurnRate")
-            UserDefaults.standard.set(true, forKey: "loginItemAIOrchestrator")
             if SMAppService.mainApp.status != .enabled { try? SMAppService.mainApp.register() }
         }
 

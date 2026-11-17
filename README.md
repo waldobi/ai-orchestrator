@@ -1,21 +1,45 @@
 # AI Orchestrator
 
-A macOS menu-bar app that watches your Claude, Codex and Cursor usage limits and sends coding requests to whichever
-account has room. It runs entirely on your Mac and reads your existing logins. There is no server and no account to
-create. An optional iPhone companion shows the same data over your local network.
+**See every AI coding plan you pay for in one place, and send work to whichever one has room.**
 
-## What it does
+AI Orchestrator is a free macOS menu-bar app for people who use more than one Claude login, or Claude alongside Codex
+and Cursor. It shows each account's 5-hour and weekly limits live, warns you before one runs out, and can route a
+coding request to the account with the most room. Everything runs on your Mac with the logins you already have:
+no server, no sign-up, no telemetry.
 
-- **Usage at a glance.** It shows the 5-hour and weekly limits for every Claude login, plus Codex and Cursor, in the
-  menu bar and in a small desktop strip you can drag anywhere.
-- **Switching.** Click an account to bring its Claude window to the front.
-- **Requests and routing.** Type a request, pick a project folder, and AI Orchestrator plans, builds and reviews it
-  across Claude, Codex and Cursor. It picks the account whose limit resets soonest, so you use plan capacity before it
-  expires. Each step runs in its own git worktree, and nothing merges until you press Merge.
-- **Spend.** Optionally import bank or card CSVs and add admin API keys to see what each tool costs you per month and
-  per repo.
+![The menu-bar panel: every account's 5-hour and weekly limits, which one to use next, and spend this month](docs/images/panel.png)
+
+<sub>Screenshots use the built-in demo mode (`scripts/demo.sh`), so every account and number is made up.</sub>
+
+## How it works
+
+1. **It finds your accounts.** It looks for your Claude desktop profiles, Claude Code logins (`~/.claude` and
+   `~/.claude-<name>`), Codex and Cursor. You don't need to type in any keys or passwords.
+2. **It reads your limits.** For Claude it asks claude.ai for the same usage numbers you see on its Settings › Usage page,
+   using your existing signed-in session. For Codex it reads the limit lines Codex writes to its own logs. For Cursor it
+   reads your plan usage from cursor.com. It refreshes every few minutes.
+3. **It shows them where you work.** You'll see a menu-bar icon and panel, and an optional desktop strip you can drag
+   anywhere. Each tile turns amber, then red, as a limit fills up. Click a tile to bring that Claude account's window
+   to the front.
+4. **It tells you what to use next.** The panel names the account with the most room and the one that frees up next.
+   It also notifies you at 90% of a limit, or when an account starts paying for extra usage.
+5. **It can do the routing for you (optional).** Write a request, pick a project folder and choose Auto. AI Orchestrator
+   plans with one tool, builds with another and reviews with a third. It always picks the account whose limit resets
+   soonest, so unused plan time isn't wasted. Each step runs in its own git worktree, risky commands like `git push`
+   or `sudo` are blocked, and nothing lands in your branch until you press Merge.
+
+![The desktop strip: one tile per account, draggable anywhere on screen](docs/images/strip.png)
+
+### Also included
+
+- **Spend tracking (optional).** Import a bank or card CSV, or add admin API keys, to see what each AI tool costs you
+  per month and per repo against a budget.
 - **CLI helpers.** `ai-route` sends a job to the tool with the most room, `idea` adds to a backlog and `orch` opens
   the request window.
+- **Handoff kit for Claude Code.** `/handoff` and `/pickup` move work between accounts when one runs low. See below.
+- **iPhone companion.** The same usage view on your phone, plus a widget, over your own Wi-Fi.
+
+<img src="docs/images/settings.png" width="480" alt="Settings: a setup checklist for accounts, plans, budget and optional extras">
 
 ## Requirements
 
@@ -46,6 +70,13 @@ If you'd rather read the script first, clone the repo and run `./install.command
 The installer compiles the six Swift files with `swiftc`, which takes a few minutes. It installs
 `~/Applications/AI Orchestrator.app` and opens it. It won't overwrite a different app that already sits at that path.
 Set `AIO_APP_PATH` to install somewhere else.
+
+To try it without signing in to anything, run the demo. It uses made-up accounts and a throwaway home folder:
+
+```bash
+scripts/demo.sh        # build and run
+scripts/demo.sh stop   # quit it
+```
 
 For a quick compile check without installing:
 
@@ -142,6 +173,8 @@ backing that file up, and leaves an existing status line alone. For a second Cla
 | `iPhone/` | Companion app and widget |
 | `handoff-kit/` | `/handoff`, `/pickup`, `/handoff-all`, their hooks and installer |
 | `install.sh` | One-line installer (clone or update, then `install.command`) |
+| `scripts/demo.sh` | Demo mode with made-up data |
+| `docs/images/` | Screenshots (demo data) |
 
 ## License
 
